@@ -76,6 +76,8 @@
         .holders-title span { color: var(--text-s); font-weight: normal; text-transform: none; font-size: 0.7rem; }
         .holder-row { display: flex; align-items: center; justify-content: space-between; padding: 7px 0; border-bottom: 1px solid rgba(255,255,255,0.04); font-size: 0.78rem; gap: 8px; }
         .holder-row:last-child { border-bottom: none; }
+        .breakdown-section-label { font-size: 0.65rem; font-weight: bold; text-transform: uppercase; letter-spacing: 0.08em; color: var(--text-s); padding: 8px 0 4px; margin-top: 4px; border-top: 1px solid rgba(255,255,255,0.06); opacity: 0.7; }
+        .breakdown-section-label:first-child { border-top: none; margin-top: 0; padding-top: 0; }
         .holder-addr { font-family: monospace; color: var(--text-s); flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
         .holder-pct { font-weight: bold; color: var(--cyan); min-width: 50px; text-align: right; }
         .holder-tag { font-size: 0.6rem; padding: 2px 6px; border-radius: 4px; font-weight: bold; white-space: nowrap; flex-shrink: 0; }
@@ -92,7 +94,7 @@
     <h1>Quick Entry Checker</h1>
 
     <span class="section-label">1. Terminal Input (Paste Scan)</span>
-    <textarea id="rawInput" placeholder="Paste Soul Scan here..." oninput="autoParse()"></textarea>
+    <textarea id="rawInput" placeholder="Paste Soul Scan here..." oninput="autoParse()" onpaste="handlePaste(event)"></textarea>
 
     <div class="ca-container">
         <div id="ca_display">No CA Detected</div>
@@ -163,49 +165,70 @@
 <script>
 let detectedCA = "";
 
-// ─── Program / Authority Constants ───────────────────────────────────────────
-const PUMP_PROGRAM_ID        = new solanaWeb3.PublicKey('6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P');
-const TOKEN_PROGRAM_ID       = new solanaWeb3.PublicKey('TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA');
-const ASSOC_TOKEN_PROGRAM_ID = new solanaWeb3.PublicKey('ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJe1bsn');
-const PUMPSWAP_PROGRAM_ID    = new solanaWeb3.PublicKey('pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA');
-const WSOL_MINT              = new solanaWeb3.PublicKey('So11111111111111111111111111111111111111112');
-const RAYDIUM_AUTHORITY      = '5Q544fKrMJu6p6mRnpCqbXmN7E4R56rM6E87t3m2n845';
+// ─── Program / Authority Constants (lazy-initialized after page load) ─────────
+let PUMP_PROGRAM_ID, TOKEN_PROGRAM_ID, ASSOC_TOKEN_PROGRAM_ID, PUMPSWAP_PROGRAM_ID, WSOL_MINT;
+const RAYDIUM_AUTHORITY = '5Q544fKrMJu6p6mRnpCqbXmN7E4R56rM6E87t3m2n845';
+
+window.addEventListener('load', () => {
+    try {
+        PUMP_PROGRAM_ID        = new solanaWeb3.PublicKey('6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P');
+        TOKEN_PROGRAM_ID       = new solanaWeb3.PublicKey('TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA');
+        ASSOC_TOKEN_PROGRAM_ID = new solanaWeb3.PublicKey('ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJe1bsn');
+        PUMPSWAP_PROGRAM_ID    = new solanaWeb3.PublicKey('pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA');
+        WSOL_MINT              = new solanaWeb3.PublicKey('So11111111111111111111111111111111111111112');
+    } catch(e) {
+        console.error('Failed to init Solana constants:', e.message);
+    }
+});
+
+// ─── Browser-safe byte helpers (no Node.js Buffer needed) ────────────────────
+const _enc = new TextEncoder();
+function strBytes(s)  { return _enc.encode(s); }          // string → Uint8Array
+function u16leBytes() { return new Uint8Array([0, 0]); }  // u16 LE 0 → Uint8Array
+function cmpBytes(a, b) {                                 // compare two Uint8Arrays
+    for (let i = 0; i < 32; i++) {
+        if (a[i] < b[i]) return -1;
+        if (a[i] > b[i]) return  1;
+    }
+    return 0;
+}
 
 // ─── PDA / ATA Derivation ────────────────────────────────────────────────────
 function getSystemAddresses(mintStr) {
     const mint = new solanaWeb3.PublicKey(mintStr);
+    const mintB = mint.toBytes();
 
     // 1. Pump.fun Bonding Curve PDA
-    //    seeds: ["bonding-curve", mint]  program: Pump.fun
+    //    seeds: ["bonding-curve", mint]   program: Pump.fun
     const [bondingCurve] = solanaWeb3.PublicKey.findProgramAddressSync(
-        [Buffer.from('bonding-curve'), mint.toBytes()],
+        [strBytes('bonding-curve'), mintB],
         PUMP_PROGRAM_ID
     );
 
-    // 2. Bonding Curve Associated Token Account (the vault that holds tokens)
-    //    seeds: [bondingCurve, TOKEN_PROGRAM, mint]  program: ATA Program
+    // 2. Bonding Curve ATA — the token vault that appears in holder lists
+    //    seeds: [bondingCurve, TOKEN_PROGRAM, mint]   program: ATA program
     const [bondingCurveATA] = solanaWeb3.PublicKey.findProgramAddressSync(
-        [bondingCurve.toBytes(), TOKEN_PROGRAM_ID.toBytes(), mint.toBytes()],
+        [bondingCurve.toBytes(), TOKEN_PROGRAM_ID.toBytes(), mintB],
         ASSOC_TOKEN_PROGRAM_ID
     );
 
     // 3. Pumpswap Pool PDA
-    //    seeds: ["pool", poolIndex (u16 LE = 0), mint0, mint1]  (mints sorted by bytes)
+    //    seeds: ["pool", u16_le_0, mint0, mint1]  mints sorted ascending by bytes
     //    program: Pumpswap
-    const mintPairs = [WSOL_MINT, mint].sort((a, b) =>
-        Buffer.compare(Buffer.from(a.toBytes()), Buffer.from(b.toBytes()))
-    );
-    const idxBuf = Buffer.alloc(2);
-    idxBuf.writeUInt16LE(0);
+    const wsolB = WSOL_MINT.toBytes();
+    const [mint0B, mint1B] = cmpBytes(mintB, wsolB) <= 0
+        ? [mintB, wsolB]
+        : [wsolB, mintB];
+
     const [pumpswapPool] = solanaWeb3.PublicKey.findProgramAddressSync(
-        [Buffer.from('pool'), idxBuf, mintPairs[0].toBytes(), mintPairs[1].toBytes()],
+        [strBytes('pool'), u16leBytes(), mint0B, mint1B],
         PUMPSWAP_PROGRAM_ID
     );
 
-    // 4. Pumpswap Pool's token vault ATA (this account holds the tokens in the pool)
-    //    seeds: [pumpswapPool, TOKEN_PROGRAM, mint]  program: ATA Program
+    // 4. Pumpswap Pool token vault ATA (holds the tokens inside the pool)
+    //    seeds: [pumpswapPool, TOKEN_PROGRAM, mint]   program: ATA program
     const [pumpswapVault] = solanaWeb3.PublicKey.findProgramAddressSync(
-        [pumpswapPool.toBytes(), TOKEN_PROGRAM_ID.toBytes(), mint.toBytes()],
+        [pumpswapPool.toBytes(), TOKEN_PROGRAM_ID.toBytes(), mintB],
         ASSOC_TOKEN_PROGRAM_ID
     );
 
@@ -217,42 +240,109 @@ function getSystemAddresses(mintStr) {
     };
 }
 
-// ─── Classify a holder address against known system addresses ────────────────
-function classifyHolder(address, sysAddr) {
-    if (address === sysAddr.bondingCurveATA || address === sysAddr.bondingCurve) {
+// ─── Human-readable AMM market type labels ───────────────────────────────────
+function marketLabel(type) {
+    const map = {
+        pump_fun_amm:  'Pumpswap Liquidity (Locked)',
+        pumpFunAmm:    'Pumpswap Liquidity (Locked)',
+        raydium:       'Raydium Liquidity',
+        raydiumCpmm:   'Raydium CPMM Liquidity',
+        raydiumAmm:    'Raydium AMM Liquidity',
+        meteoraDlmm:   'Meteora DLMM Liquidity',
+        meteora:       'Meteora Liquidity',
+        orca:          'Orca Liquidity',
+    };
+    return map[type] || (type ? type + ' Liquidity' : 'AMM Liquidity');
+}
+
+// ─── Classify one holder using all available data sources ────────────────────
+// h          — raw holder object from RugCheck (has .address and .owner)
+// sysAddr    — our computed Pump.fun bonding curve PDA/ATA
+// knownAccts — RugCheck's knownAccounts dict (address → {name, type})
+// markets    — RugCheck's markets array (pool pubkeys + liquidityA/B addresses)
+function classifyHolder(h, sysAddr, knownAccts, markets) {
+    const addr  = h.address || '';
+    const owner = h.owner   || '';
+
+    // ── 1. Bonding curve (PDA computation is reliable; check OWNER field) ────
+    if (owner === sysAddr.bondingCurve  ||
+        addr  === sysAddr.bondingCurve  ||
+        owner === sysAddr.bondingCurveATA ||
+        addr  === sysAddr.bondingCurveATA) {
         return { isSystem: true, label: 'System: Bonding Curve', tagClass: 'tag-system-bc' };
     }
-    if (address === RAYDIUM_AUTHORITY) {
-        return { isSystem: true, label: 'System: Migrated Liquidity (Raydium)', tagClass: 'tag-system-ray' };
+
+    // ── 2. RugCheck knownAccounts — covers all labeled AMM pools ─────────────
+    //       (addr can itself be labeled, OR the owner wallet can be labeled)
+    const knownByAddr  = knownAccts[addr]  || {};
+    const knownByOwner = knownAccts[owner] || {};
+    if (knownByAddr.type === 'AMM') {
+        return { isSystem: true, label: `System: ${knownByAddr.name}`,  tagClass: 'tag-system-pswap' };
     }
-    if (address === sysAddr.pumpswapPool || address === sysAddr.pumpswapVault) {
-        return { isSystem: true, label: 'System: Pumpswap Liquidity (Locked/Burned)', tagClass: 'tag-system-pswap' };
+    if (knownByOwner.type === 'AMM') {
+        return { isSystem: true, label: `System: ${knownByOwner.name}`, tagClass: 'tag-system-pswap' };
     }
+
+    // ── 3. RugCheck markets — match liquidityA/B token accounts or pool pubkey ─
+    for (const mkt of markets) {
+        if (addr  === mkt.liquidityA ||
+            addr  === mkt.liquidityB ||
+            addr  === mkt.pubkey     ||
+            owner === mkt.pubkey) {
+            return { isSystem: true, label: `System: ${marketLabel(mkt.marketType)}`, tagClass: 'tag-system-pswap' };
+        }
+    }
+
+    // ── 4. Raydium authority fallback ─────────────────────────────────────────
+    if (addr === RAYDIUM_AUTHORITY || owner === RAYDIUM_AUTHORITY) {
+        return { isSystem: true, label: 'System: Raydium Liquidity', tagClass: 'tag-system-ray' };
+    }
+
     return { isSystem: false, label: 'Retail / Trader', tagClass: 'tag-retail' };
 }
 
 // ─── Render holder breakdown panel ──────────────────────────────────────────
-function renderHolderBreakdown(classified) {
+function renderHolderBreakdown(systemHolders, retailTop10) {
     const panel   = document.getElementById('holders_panel');
     const list    = document.getElementById('holders_list');
     const summary = document.getElementById('holders_summary');
 
-    const systemCount = classified.filter(h => h.isSystem).length;
-    const retailPct   = classified.filter(h => !h.isSystem).reduce((a, h) => a + h.pct, 0);
+    const retailPct = retailTop10.reduce((a, h) => a + h.pct, 0);
+    summary.textContent = `${systemHolders.length} system address${systemHolders.length !== 1 ? 'es' : ''} excluded · Top 10 retail: ${retailPct.toFixed(2)}%`;
 
-    summary.textContent = `${systemCount} system address${systemCount !== 1 ? 'es' : ''} excluded · Retail sum: ${retailPct.toFixed(2)}%`;
-
-    list.innerHTML = classified.map((h, i) => {
-        const short = h.address.slice(0, 6) + '…' + h.address.slice(-4);
+    function holderRow(h, label, tagClass, rankLabel) {
+        const short   = h.address.slice(0, 6) + '…' + h.address.slice(-4);
+        const tooltip = `addr:  ${h.address}\nowner: ${h.owner || 'N/A'}`;
         return `
         <div class="holder-row">
-            <span class="holder-num">#${i + 1}</span>
-            <span class="holder-addr" title="${h.address}">${short}</span>
+            <span class="holder-num">${rankLabel}</span>
+            <span class="holder-addr" title="${tooltip}">${short}</span>
             <span class="holder-pct">${h.pct.toFixed(2)}%</span>
-            <span class="holder-tag ${h.tagClass}">${h.label}</span>
+            <span class="holder-tag ${tagClass}">${label}</span>
         </div>`;
-    }).join('');
+    }
 
+    let html = '';
+
+    // ── Section 1: excluded system / LP addresses ────────────────────────────
+    if (systemHolders.length > 0) {
+        html += `<div class="breakdown-section-label">⛔ EXCLUDED (LP / System)</div>`;
+        html += systemHolders.map(h =>
+            holderRow(h, h.label, h.tagClass, '—')
+        ).join('');
+    }
+
+    // ── Section 2: actual top-10 retail holders ──────────────────────────────
+    html += `<div class="breakdown-section-label">✅ TOP 10 RETAIL HOLDERS</div>`;
+    if (retailTop10.length === 0) {
+        html += `<div class="holder-row"><span style="color:#888;font-size:0.85em">No retail holders found</span></div>`;
+    } else {
+        html += retailTop10.map((h, i) =>
+            holderRow(h, 'Retail / Trader', 'tag-retail', `#${i + 1}`)
+        ).join('');
+    }
+
+    list.innerHTML = html;
     panel.classList.add('visible');
 }
 
@@ -275,7 +365,7 @@ async function fetchTopHolders() {
     } catch (e) {
         status.innerText = '🔴 INVALID CA';
         status.className = 'status-tag tag-off';
-        console.error('PDA derivation failed:', e);
+        console.error('PDA derivation failed:', e.message || String(e), e.stack);
         return;
     }
 
@@ -284,20 +374,27 @@ async function fetchTopHolders() {
         const data = await res.json();
 
         if (data.topHolders && data.topHolders.length > 0) {
-            // Take raw top-10, classify each address
-            const classified = data.topHolders.slice(0, 10).map(h => ({
+            // Build lookup sets from RugCheck's own market metadata
+            const knownAccts = data.knownAccounts || {};
+            const markets    = data.markets       || [];
+
+            // Classify ALL returned holders (RugCheck gives up to 20)
+            const allClassified = (data.topHolders || []).map(h => ({
                 ...h,
-                ...classifyHolder(h.address, sysAddr),
+                ...classifyHolder(h, sysAddr, knownAccts, markets),
             }));
 
-            // Retail-only Top 10 % (system addresses excluded)
-            const retailTop10 = classified
+            // Top 10 RETAIL holders (system/LP addresses fully excluded)
+            const retailTop10 = allClassified
                 .filter(h => !h.isSystem)
-                .reduce((acc, h) => acc + h.pct, 0);
+                .slice(0, 10);
 
-            document.getElementById('in_top10').value = retailTop10.toFixed(2);
+            const retailTop10Pct = retailTop10.reduce((acc, h) => acc + h.pct, 0);
+            document.getElementById('in_top10').value = retailTop10Pct.toFixed(2);
 
-            renderHolderBreakdown(classified);
+            // Panel shows: system addresses found + the actual retail top-10
+            const systemHolders = allClassified.filter(h => h.isSystem);
+            renderHolderBreakdown(systemHolders, retailTop10);
 
             status.innerText = '🟢 API CONNECTED';
             status.className = 'status-tag tag-on';
@@ -312,37 +409,169 @@ async function fetchTopHolders() {
     }
 }
 
+// ─── TEXT CLEANER ────────────────────────────────────────────────────────────
+// Soul Scan output embeds URLs inside label text, e.g.:
+//   👥 Hodls (https://solscan.io/token/CA#holders): 141 • Top: 0%
+// We must strip ALL URLs and their surrounding parentheses, date/time headers,
+// and leftover empty brackets so the downstream regexes see clean label: value pairs.
+function cleanInput(raw) {
+    return raw
+        // 1. Remove full bracketed URLs — (https://...) — common in Soul Scan
+        .replace(/\(\s*https?:\/\/[^)]+\)/gi, '')
+        // 2. Remove any remaining bare https/http URLs
+        .replace(/https?:\/\/\S+/gi, '')
+        // 3. Remove bare domain paths without protocol, e.g. solscan.io/token/...
+        .replace(/\b[\w-]+\.(io|com|xyz|app|fun|me|gg|net|org|dev|to)\/\S*/gi, '')
+        // 4. Remove Soul Scan / Telegram timestamp header: [DD/MM/YYYY HH:MM AM/PM] Name:
+        .replace(/^\[[\d/]+\s+[\d:]+\s*(?:AM|PM)?\]\s*[^:\n]+:/gim, '')
+        // 5. Remove standalone timestamps: 12:34 PM or 01:21
+        .replace(/\b\d{1,2}:\d{2}(?::\d{2})?(?:\s*[AP]M)?\b/gi, '')
+        // 6. Remove standalone date patterns: DD/MM/YYYY, YYYY-MM-DD, etc.
+        .replace(/\b\d{1,4}[\/\-.]\d{1,2}[\/\-.]\d{2,4}\b/g, '')
+        // 7. Remove leftover empty parens ()
+        .replace(/\(\s*\)/g, '')
+        // 8. Collapse 3+ newlines to 2
+        .replace(/\n{3,}/g, '\n\n')
+        .trim();
+}
+
+// ─── Number parser: $3.9K → 3900, $1.2M → 1200000, $130 → 130 ───────────────
+function parseMoney(str) {
+    if (!str) return 0;
+    str = str.replace(/,/g, '').trim();
+    const m = str.match(/([\d.]+)\s*([KkMmBb])?/);
+    if (!m) return 0;
+    let n = parseFloat(m[1]);
+    const s = (m[2] || '').toUpperCase();
+    if (s === 'K') n *= 1_000;
+    if (s === 'M') n *= 1_000_000;
+    if (s === 'B') n *= 1_000_000_000;
+    return n;
+}
+
+// ─── Try multiple patterns, return first capture or '' ───────────────────────
+function tryMatch(text, ...patterns) {
+    for (const re of patterns) {
+        const m = text.match(re);
+        if (m && m[1] !== undefined) return m[1];
+    }
+    return '';
+}
+
+// ─── PASTE HANDLER — cleans the textarea content immediately on paste ─────────
+function handlePaste(event) {
+    event.preventDefault();   // stop the default paste
+    const pasted = (event.clipboardData || window.clipboardData).getData('text');
+    const cleaned = cleanInput(pasted);
+    const ta = document.getElementById('rawInput');
+    // Insert cleaned text at cursor (replaces selection if any)
+    const start = ta.selectionStart;
+    const end   = ta.selectionEnd;
+    ta.value = ta.value.slice(0, start) + cleaned + ta.value.slice(end);
+    ta.selectionStart = ta.selectionEnd = start + cleaned.length;
+    autoParse();
+}
+
 // ─── AUTO-PARSE ──────────────────────────────────────────────────────────────
 function autoParse() {
-    const text = document.getElementById('rawInput').value;
+    const raw  = document.getElementById('rawInput').value;
+    const text = cleanInput(raw);
 
-    const caMatch = text.match(/[1-9A-HJ-NP-Za-km-z]{32,44}/);
-    if (caMatch) {
-        detectedCA = caMatch[0];
+    // ── CA Detection ──────────────────────────────────────────────────────────
+    // Priority 1: a base58 string that sits ALONE on its own line (Soul Scan
+    //             places the CA bare on a dedicated line after all the links).
+    // Priority 2: first 43-44 char base58 string found anywhere in clean text.
+    // Priority 3: fallback 32-44 chars.
+    // Base58 alphabet: 1-9 A-H J-N P-Z a-k m-z  (no 0, O, I, l)
+    const b58    = '[1-9A-HJ-NP-Za-km-z]';
+    const lineCA = text.match(new RegExp(`^\\s*(${b58}{32,44})\\s*$`, 'm'));
+    const anyCA  = text.match(new RegExp(`${b58}{43,44}`));
+
+    const found = (lineCA && lineCA[1]) || (anyCA && anyCA[0]) || '';
+    if (found) {
+        detectedCA = found;
         document.getElementById('ca_display').innerText = detectedCA;
     }
 
-    const mc       = (text.match(/MC:\s+\$([\d.]+)K/i)            || [0,0])[1] * 1000;
-    const liq      = (text.match(/Liq:\s+\$([\d.]+)K/i)           || [0,0])[1] * 1000;
-    const vol      = (text.match(/Vol:\s+\$([\d.]+)K/i)            || [0,0])[1] * 1000;
-    const h        = (text.match(/Hodls:\s+(\d+)/i)               || [0,0])[1];
-    const f_qty    = (text.match(/Fake:\s+(\d+)/i)                 || [0,0])[1];
-    const f_perc   = (text.match(/Fake:\s+\d+\s+\[([\d.]+)%\]/i)  || [0,0])[1];
-    const air      = (text.match(/Airdrop:\s+(\d+)%/i)             || [0,0])[1];
-    const top1     = (text.match(/High:\s+([\d.]+)%/i)             || [0,0])[1];
-    const bun_perc = (text.match(/Holding:\s+([\d.]+)%/i)          || [0,0])[1];
-    const bun_qty  = (text.match(/Wallets:\s+(\d+)/i)              || [0,0])[1];
+    // ── Market Cap ────────────────────────────────────────────────────────────
+    // Soul Scan: "💰 MC:   $3.9K •🔝$95.8K"  — take the first (current) value
+    const mcRaw = tryMatch(text,
+        /\bMC\s*:\s*\$?([\d.]+\s*[KkMmBb]?)/i,
+        /Market\s*Cap\s*:\s*\$?([\d.]+\s*[KkMmBb]?)/i,
+        /Mcap\s*:\s*\$?([\d.]+\s*[KkMmBb]?)/i
+    );
 
-    document.getElementById('in_mc').value       = mc       || 0;
-    document.getElementById('in_liq').value      = liq      || 0;
-    document.getElementById('in_vol').value      = vol      || 0;
-    document.getElementById('in_h').value        = h        || 0;
-    document.getElementById('in_f_qty').value    = f_qty    || 0;
-    document.getElementById('in_f_perc').value   = f_perc   || 0;
-    document.getElementById('in_bun_perc').value = bun_perc || 0;
-    document.getElementById('in_bun_qty').value  = bun_qty  || 0;
-    document.getElementById('in_air').value      = air      || 0;
-    document.getElementById('in_top1').value     = top1     || 0;
+    // ── Liquidity ─────────────────────────────────────────────────────────────
+    // Soul Scan: "💧 Liq:    $5K [28 SOL]"
+    const liqRaw = tryMatch(text,
+        /\bLiq(?:uidity)?\s*:\s*\$?([\d.]+\s*[KkMmBb]?)/i
+    );
+
+    // ── Volume ────────────────────────────────────────────────────────────────
+    // Soul Scan: "📊 Vol:    $130 [1h]"  — no K/M suffix on small values
+    const volRaw = tryMatch(text,
+        /\bVol(?:ume)?\s*:\s*\$?([\d.]+\s*[KkMmBb]?)/i
+    );
+
+    // ── Holders ───────────────────────────────────────────────────────────────
+    // Soul Scan after clean: "👥 Hodls : 141 • Top: 0%"
+    // The URL was inside the label, so after removal we get "Hodls :"
+    const h = tryMatch(text,
+        /Hodls?\s*:\s*(\d[\d,]*)/i,
+        /Holders?\s*:\s*(\d[\d,]*)/i,
+        /Hodls?\s+\S*\s*:\s*(\d[\d,]*)/i
+    ).replace(/,/g, '');
+
+    // ── Top holder % ──────────────────────────────────────────────────────────
+    // Soul Scan: "• Top: 0%"  (appears on Hodls line)
+    const top1 = tryMatch(text,
+        /•\s*Top\s*:\s*([\d.]+)%/i,
+        /\bTop\s*:\s*([\d.]+)%/i,
+        /High(?:est)?\s*:\s*([\d.]+)%/i,
+        /Top\s*(?:1|Holder)\s*:\s*([\d.]+)%/i
+    );
+
+    // ── Fake volume / wallets ─────────────────────────────────────────────────
+    // Soul Scan shows fake VOLUME as "$0" not a wallet count.
+    // We set qty=0 and perc=0 for pure-volume format; support old count format too.
+    const f_qty = tryMatch(text,
+        /Fake\s*:\s*(\d+)\s/i           // old format: "Fake: 12 [3.5%]"
+    ).replace(/,/g, '');
+    const f_perc = tryMatch(text,
+        /Fake[^\n]*\[([\d.]+)%\]/i,     // old format: "Fake: 12 [3.5%]"
+        /Fake[^\n]*:\s*([\d.]+)%/i
+    );
+
+    // ── Airdrop ───────────────────────────────────────────────────────────────
+    // Soul Scan: "┗ Airdrop: 0% 🤍"
+    const air = tryMatch(text,
+        /Airdrop\s*:\s*([\d.]+)%/i
+    );
+
+    // ── Bundle stats ──────────────────────────────────────────────────────────
+    // Soul Scan bundle detail section: "💎 Holding: 0%" and "💼 Wallets: 69"
+    // Main scan line: "/Bundles : 18 • 110% → 0%" (current holding after arrow)
+    const bun_perc = tryMatch(text,
+        /💎\s*Holding\s*:\s*([\d.]+)%/i,    // bundle detail section (preferred)
+        /Holding\s*:\s*([\d.]+)%/i,          // generic
+        /→\s*([\d.]+)%/                      // "110% → 0%" — take value after arrow
+    );
+    const bun_qty = tryMatch(text,
+        /💼\s*Wallets?\s*:\s*(\d+)/i,        // bundle detail section (preferred)
+        /Wallets?\s*:\s*(\d+)/i
+    ).replace(/,/g, '');
+
+    // ── Set fields ────────────────────────────────────────────────────────────
+    document.getElementById('in_mc').value       = mcRaw  ? Math.round(parseMoney(mcRaw))  : '';
+    document.getElementById('in_liq').value      = liqRaw ? Math.round(parseMoney(liqRaw)) : '';
+    document.getElementById('in_vol').value      = volRaw ? Math.round(parseMoney(volRaw)) : '';
+    document.getElementById('in_h').value        = h        || '';
+    document.getElementById('in_f_qty').value    = f_qty    || '0';
+    document.getElementById('in_f_perc').value   = f_perc   || '0';
+    document.getElementById('in_bun_perc').value = bun_perc || '';
+    document.getElementById('in_bun_qty').value  = bun_qty  || '';
+    document.getElementById('in_air').value      = air      || '';
+    document.getElementById('in_top1').value     = top1     || '';
 }
 
 // ─── COPY CA ─────────────────────────────────────────────────────────────────
